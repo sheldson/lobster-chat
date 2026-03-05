@@ -5,6 +5,7 @@ from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
 ROOT = Path(__file__).resolve().parents[1]
 DATA = ROOT / "data"
+ASSETS = ROOT / "assets"
 
 
 def load_en_font(size: int):
@@ -68,9 +69,21 @@ def lobster_avatar(size=220):
     return img
 
 
+def make_circle_avatar_from_image(path: Path, size=220):
+    av = Image.open(path).convert("RGB").resize((size, size))
+    mask = Image.new("L", (size, size), 0)
+    md = ImageDraw.Draw(mask)
+    md.ellipse((0, 0, size - 1, size - 1), fill=255)
+    av_rgba = Image.new("RGBA", (size, size))
+    av_rgba.paste(av, (0, 0))
+    av_rgba.putalpha(mask)
+    return av_rgba
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--owner", default="林晓胜")
+    ap.add_argument("--avatar", default="", help="optional avatar image path (Gemini output etc.)")
     args = ap.parse_args()
 
     qr_path = DATA / "my-lobster-qr-latest.png"
@@ -88,8 +101,15 @@ def main():
     small_f = load_en_font(28)
     name_f = load_cn_font(40)
 
-    # avatar centered
-    avatar = lobster_avatar(220)
+    # avatar centered (priority: --avatar > assets/default-lobster-avatar.jpg > drawn lobster)
+    avatar_path = Path(args.avatar).expanduser() if args.avatar else None
+    default_avatar = ASSETS / "default-lobster-avatar.jpg"
+    if avatar_path and avatar_path.exists():
+        avatar = make_circle_avatar_from_image(avatar_path, 220)
+    elif default_avatar.exists():
+        avatar = make_circle_avatar_from_image(default_avatar, 220)
+    else:
+        avatar = lobster_avatar(220)
     card.paste(avatar, ((card_w - 220) // 2, 82), avatar)
 
     draw_center_text(draw, "Lobster Connect", 330, title_f, (30, 38, 50), card_w)
