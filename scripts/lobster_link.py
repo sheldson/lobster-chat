@@ -19,7 +19,7 @@ PENDING = DATA / "pending_shares.json"
 
 
 def now_iso():
-    return dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def ensure_files():
@@ -71,7 +71,7 @@ def register_relay(me):
     if not me.get("relay_url"):
         return
     url = me["relay_url"].rstrip("/") + "/register"
-    post_json(url, {"lobster_id": me["lobster_id"], "name": me["name"]})
+    post_json(url, {"lobster_id": me["lobster_id"], "name": me["name"], "pull_token": me.get("pull_token", "")})
 
 
 def cmd_init(args):
@@ -80,12 +80,14 @@ def cmd_init(args):
         print("Already initialized. Use --force to reset.")
         return 1
     secret = uuid.uuid4().hex + uuid.uuid4().hex
+    pull_token = uuid.uuid4().hex
     me = {
         "lobster_id": str(uuid.uuid4()),
         "name": args.name,
         "endpoint": args.endpoint,
         "relay_url": args.relay_url,
         "secret": secret,
+        "pull_token": pull_token,
         "created_at": now_iso(),
     }
     s["me"] = me
@@ -151,6 +153,9 @@ def cmd_qr(args):
 
 
 def cmd_add_peer(args):
+    """Scan a peer's QR and send them a friend_request.  Status starts as
+    'pending_sent' on our side.  The remote lobster's owner must approve
+    before messages can flow."""
     s = load_state()
     me = s.get("me")
     if not me:
@@ -159,16 +164,73 @@ def cmd_add_peer(args):
     pid = p["lobster_id"]
     if pid == me["lobster_id"]:
         raise SystemExit("Cannot add self.")
-    s["peers"][pid] = {
+    # Store peer with pending status — NOT active yet
+    peer_info = {
         "lobster_id": pid,
         "name": p.get("name", args.label or "peer"),
         "endpoint": p.get("endpoint"),
         "relay_url": p.get("relay_url"),
-        "status": "active",
+        "status": "pending_sent",
         "created_at": now_iso(),
     }
+    s["peers"][pid] = peer_info
     save_state(s)
-    print(json.dumps({"ok": True, "peer": s["peers"][pid]}, ensure_ascii=False))
+    # Send friend_request to the peer via relay/endpoint
+    env = build_envelope(s, pid, "friend_request", {
+        "name": me["name"],
+        "relay_url": me.get("relay_url", ""),
+        "endpoint": me.get("endpoint", ""),
+    })
+    append_jsonl(OUTBOX, env)
+    try:
+        deliver_to_peer(peer_info, env)
+    except Exception:
+        pass
+    print(json.dumps({"ok": True, "peer": peer_info, "note": "friend_request sent; waiting for peer owner approval"}, ensure_ascii=False))
+    return 0
+
+
+def cmd_approve_peer(args):
+    """Owner approves an incoming friend request (peer in 'pending_received' state)."""
+    s = load_state()
+    peer = s["peers"].get(args.peer)
+    if not peer:
+        raise SystemExit("Peer not found")
+    if peer["status"] != "pending_received":
+        raise SystemExit(f"Peer status is '{peer['status']}', not pending_received")
+    peer["status"] = "active"
+    peer["approved_at"] = now_iso()
+    save_state(s)
+    # Notify the peer that their request was accepted
+    env = build_envelope(s, args.peer, "friend_accepted", {})
+    append_jsonl(OUTBOX, env)
+    try:
+        deliver_to_peer(peer, env)
+    except Exception:
+        pass
+    print(json.dumps({"ok": True, "peer": args.peer, "status": "active"}, ensure_ascii=False))
+    return 0
+
+
+def cmd_reject_peer(args):
+    """Owner rejects an incoming friend request."""
+    s = load_state()
+    peer = s["peers"].get(args.peer)
+    if not peer:
+        raise SystemExit("Peer not found")
+    if peer["status"] != "pending_received":
+        raise SystemExit(f"Peer status is '{peer['status']}', not pending_received")
+    peer["status"] = "rejected"
+    peer["rejected_at"] = now_iso()
+    save_state(s)
+    # Notify the peer
+    env = build_envelope(s, args.peer, "friend_rejected", {})
+    append_jsonl(OUTBOX, env)
+    try:
+        deliver_to_peer(peer, env)
+    except Exception:
+        pass
+    print(json.dumps({"ok": True, "peer": args.peer, "status": "rejected"}, ensure_ascii=False))
     return 0
 
 
@@ -211,17 +273,59 @@ def cmd_send(args):
         return 2
 
 
+def process_protocol_message(s, msg):
+    """Handle protocol-level intents that change peer state."""
+    intent = msg.get("intent", "")
+    frm = msg.get("from", "")
+    body = msg.get("body", {})
+
+    if intent == "friend_request":
+        if frm in s["peers"] and s["peers"][frm]["status"] == "active":
+            return  # already friends
+        s["peers"][frm] = {
+            "lobster_id": frm,
+            "name": body.get("name", "unknown"),
+            "endpoint": body.get("endpoint", ""),
+            "relay_url": body.get("relay_url", ""),
+            "status": "pending_received",
+            "created_at": now_iso(),
+        }
+        save_state(s)
+
+    elif intent == "friend_accepted":
+        peer = s["peers"].get(frm)
+        if peer and peer["status"] == "pending_sent":
+            peer["status"] = "active"
+            peer["approved_at"] = now_iso()
+            save_state(s)
+
+    elif intent == "friend_rejected":
+        peer = s["peers"].get(frm)
+        if peer and peer["status"] == "pending_sent":
+            peer["status"] = "rejected"
+            peer["rejected_at"] = now_iso()
+            save_state(s)
+
+    elif intent == "disconnect":
+        peer = s["peers"].get(frm)
+        if peer:
+            peer["status"] = "blocked"
+            peer["blocked_at"] = now_iso()
+            save_state(s)
+
+
 def cmd_pull(_args):
     s = load_state()
     me = s.get("me")
     if not me or not me.get("relay_url"):
         raise SystemExit("relay_url not configured")
-    q = parse.urlencode({"lobster_id": me["lobster_id"]})
+    q = parse.urlencode({"lobster_id": me["lobster_id"], "pull_token": me.get("pull_token", "")})
     url = me["relay_url"].rstrip("/") + f"/pull?{q}"
     resp = get_json(url)
     msgs = resp.get("messages", [])
     for m in msgs:
         append_jsonl(INBOX, m)
+        process_protocol_message(s, m)
     print(json.dumps({"ok": True, "pulled": len(msgs)}, ensure_ascii=False))
     return 0
 
@@ -240,6 +344,14 @@ def cmd_disconnect(args):
     p = s["peers"].get(args.peer)
     if not p:
         raise SystemExit("Peer not found")
+    # Notify the peer before blocking
+    if p.get("status") == "active":
+        env = build_envelope(s, args.peer, "disconnect", {})
+        append_jsonl(OUTBOX, env)
+        try:
+            deliver_to_peer(p, env)
+        except Exception:
+            pass
     p["status"] = "blocked"
     p["blocked_at"] = now_iso()
     save_state(s)
@@ -332,6 +444,14 @@ def main():
     p.add_argument("--qr", required=True, help="QR payload JSON text")
     p.add_argument("--label")
     p.set_defaults(fn=cmd_add_peer)
+
+    p = sub.add_parser("approve-peer")
+    p.add_argument("--peer", required=True, help="lobster_id of peer to approve")
+    p.set_defaults(fn=cmd_approve_peer)
+
+    p = sub.add_parser("reject-peer")
+    p.add_argument("--peer", required=True, help="lobster_id of peer to reject")
+    p.set_defaults(fn=cmd_reject_peer)
 
     p = sub.add_parser("send")
     p.add_argument("--to", required=True)

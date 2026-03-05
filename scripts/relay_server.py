@@ -9,6 +9,9 @@ ROOT = Path(__file__).resolve().parents[1]
 DATA = ROOT / "data"
 RELAY = DATA / "relay.json"
 
+MAX_BODY_BYTES = 64 * 1024  # 64 KB per message
+MAX_QUEUE_LEN = 500  # max queued messages per lobster
+
 
 def load():
     DATA.mkdir(parents=True, exist_ok=True)
@@ -30,6 +33,8 @@ class H(BaseHTTPRequestHandler):
 
     def do_POST(self):
         n = int(self.headers.get("Content-Length", "0"))
+        if n > MAX_BODY_BYTES:
+            return self._json(413, {"ok": False, "error": "payload_too_large"})
         raw = self.rfile.read(n)
         try:
             body = json.loads(raw.decode("utf-8")) if raw else {}
@@ -42,7 +47,8 @@ class H(BaseHTTPRequestHandler):
             lid = body.get("lobster_id")
             if not lid:
                 return self._json(400, {"ok": False, "error": "missing_lobster_id"})
-            db["clients"][lid] = {"name": body.get("name", "")}
+            pull_token = body.get("pull_token", "")
+            db["clients"][lid] = {"name": body.get("name", ""), "pull_token": pull_token}
             db["queues"].setdefault(lid, [])
             save(db)
             return self._json(200, {"ok": True})
@@ -52,7 +58,10 @@ class H(BaseHTTPRequestHandler):
             to = env.get("to")
             if not to:
                 return self._json(400, {"ok": False, "error": "missing_to"})
-            db["queues"].setdefault(to, []).append(env)
+            queue = db["queues"].setdefault(to, [])
+            if len(queue) >= MAX_QUEUE_LEN:
+                return self._json(429, {"ok": False, "error": "queue_full"})
+            queue.append(env)
             save(db)
             return self._json(200, {"ok": True, "queued_for": to})
 
@@ -66,7 +75,15 @@ class H(BaseHTTPRequestHandler):
         lid = (qs.get("lobster_id") or [None])[0]
         if not lid:
             return self._json(400, {"ok": False, "error": "missing_lobster_id"})
+
         db = load()
+        # Verify pull_token if the client registered one
+        client = db["clients"].get(lid)
+        if client and client.get("pull_token"):
+            token = (qs.get("pull_token") or [None])[0]
+            if token != client["pull_token"]:
+                return self._json(403, {"ok": False, "error": "invalid_pull_token"})
+
         msgs = db["queues"].get(lid, [])
         db["queues"][lid] = []
         save(db)
