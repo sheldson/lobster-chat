@@ -108,21 +108,27 @@ def _build_envelope(s, to, intent, body):
 
 
 def _deliver(peer, envelope):
-    # Priority 1: GitHub Gist (zero-server, default)
+    # Priority 1: Direct endpoint (P2P via tunnel — primary, zero-infrastructure)
+    if peer.get("endpoint"):
+        try:
+            result = _post_json(peer["endpoint"], envelope)
+            return {"ok": True, "delivery": "direct_endpoint"}
+        except Exception:
+            pass  # Fall through to other transports
+    # Priority 2: GitHub Gist (zero-server fallback)
     if peer.get("gist_id"):
-        from github_transport import send_message as gist_send
-        result = gist_send(peer["gist_id"], envelope)
-        if result.get("ok"):
-            return {"ok": True, "delivery": "github_gist"}
-        # Fall through to relay if gist fails
-    # Priority 2: Relay server (if configured)
+        try:
+            from github_transport import send_message as gist_send
+            result = gist_send(peer["gist_id"], envelope)
+            if result.get("ok"):
+                return {"ok": True, "delivery": "github_gist"}
+        except Exception:
+            pass
+    # Priority 3: Relay server (if configured)
     if peer.get("relay_url"):
         url = peer["relay_url"].rstrip("/") + "/send"
         return _post_json(url, {"envelope": envelope})
-    # Priority 3: Direct endpoint
-    if peer.get("endpoint"):
-        return _post_json(peer["endpoint"], envelope)
-    return {"ok": False, "delivery": "no_transport", "error": "peer has no gist_id, relay_url, or endpoint"}
+    return {"ok": False, "delivery": "no_transport", "error": "peer has no endpoint, gist_id, or relay_url"}
 
 
 def _register_relay(me):
@@ -215,8 +221,15 @@ def decode_qr_token(s: str) -> dict:
 # ---------------------------------------------------------------------------
 
 def init(name: str, relay_url: str = "", endpoint: str = "", force: bool = False) -> dict:
-    """Initialize this lobster's identity. Creates a GitHub Gist as inbox (default).
-    Falls back to relay_url if GitHub token not available."""
+    """Initialize this lobster's identity.
+
+    Transport setup (tried in order):
+    1. Direct endpoint (P2P) — if --endpoint is given, or auto-detected via tunnel
+    2. GitHub Gist — if GITHUB_TOKEN is available, creates a Gist inbox as fallback
+    3. Relay — if --relay-url is given
+
+    The recommended setup: run inbox_server.py locally + expose via tunnel.
+    """
     s = _load_state()
     if s.get("me") and not force:
         return {"ok": False, "error": "already_initialized"}
@@ -236,7 +249,11 @@ def init(name: str, relay_url: str = "", endpoint: str = "", force: bool = False
         "pull_token": pull_token,
         "created_at": _now_iso(),
     }
-    # Try to create GitHub Gist inbox (zero-server mode)
+    transports = []
+    # Primary: direct endpoint (P2P)
+    if endpoint:
+        transports.append("direct_endpoint")
+    # Fallback: GitHub Gist
     try:
         from github_transport import create_inbox, check_token
         token_check = check_token()
@@ -244,19 +261,38 @@ def init(name: str, relay_url: str = "", endpoint: str = "", force: bool = False
             gist_result = create_inbox(name)
             if gist_result.get("ok"):
                 me["gist_id"] = gist_result["gist_id"]
+                transports.append("github_gist")
     except Exception:
         pass
-    s["me"] = me
-    s["peers"] = {}
-    _save_state(s)
-    # Register with relay if configured (fallback mode)
-    if relay_url and not me.get("gist_id"):
+    # Fallback: Relay
+    if relay_url:
+        transports.append("relay")
         try:
             _register_relay(me)
         except Exception:
             pass
-    transport = "github_gist" if me.get("gist_id") else ("relay" if relay_url else "none")
-    return {"ok": True, "lobster_id": me["lobster_id"], "name": name, "transport": transport, "gist_id": me.get("gist_id", "")}
+    s["me"] = me
+    s["peers"] = {}
+    _save_state(s)
+    return {
+        "ok": True,
+        "lobster_id": me["lobster_id"],
+        "name": name,
+        "transports": transports,
+        "endpoint": endpoint,
+        "gist_id": me.get("gist_id", ""),
+    }
+
+
+def update_endpoint(endpoint: str) -> dict:
+    """Update this lobster's public endpoint URL (e.g. after starting a new tunnel)."""
+    s = _load_state()
+    me = s.get("me")
+    if not me:
+        return {"ok": False, "error": "not_initialized"}
+    me["endpoint"] = endpoint
+    _save_state(s)
+    return {"ok": True, "endpoint": endpoint}
 
 
 def get_my_identity() -> dict:
@@ -390,43 +426,83 @@ def send_message(to: str, text: str, intent: str = "ask") -> dict:
 
 
 def pull_messages() -> dict:
-    """Pull new messages. Tries GitHub Gist first, then relay."""
+    """Pull new messages from all available transports.
+
+    Transport priority for pulling:
+    1. Local inbox file (messages delivered directly via P2P endpoint)
+    2. GitHub Gist (if configured)
+    3. Relay (if configured)
+
+    Messages from local inbox are already written by inbox_server.py,
+    so we read and clear them. Gist/relay messages are fetched remotely.
+    """
     s = _load_state()
     me = s.get("me")
     if not me:
         return {"ok": False, "error": "not_initialized"}
 
     raw_msgs = []
-    transport_used = "none"
+    transports_used = []
 
-    # Try GitHub Gist first
+    # Source 1: Local inbox file (P2P direct messages from inbox_server.py)
+    _ensure_files()
+    inbox_text = INBOX.read_text().strip()
+    local_msgs = []
+    if inbox_text:
+        for line in inbox_text.split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                local_msgs.append(json.loads(line))
+            except Exception:
+                continue
+        if local_msgs:
+            # Clear the inbox file after reading
+            INBOX.write_text("")
+            raw_msgs.extend(local_msgs)
+            transports_used.append("local_inbox")
+
+    # Source 2: GitHub Gist
     if me.get("gist_id"):
         try:
             from github_transport import pull_messages as gist_pull
             gist_result = gist_pull(me["gist_id"])
-            if gist_result.get("ok"):
-                raw_msgs = gist_result.get("messages", [])
-                transport_used = "github_gist"
+            if gist_result.get("ok") and gist_result.get("messages"):
+                raw_msgs.extend(gist_result["messages"])
+                transports_used.append("github_gist")
         except Exception:
             pass
 
-    # Fallback to relay
-    if not raw_msgs and me.get("relay_url"):
-        q = parse.urlencode({"lobster_id": me["lobster_id"], "pull_token": me.get("pull_token", "")})
-        url = me["relay_url"].rstrip("/") + f"/pull?{q}"
+    # Source 3: Relay
+    if me.get("relay_url"):
         try:
+            q = parse.urlencode({"lobster_id": me["lobster_id"], "pull_token": me.get("pull_token", "")})
+            url = me["relay_url"].rstrip("/") + f"/pull?{q}"
             resp = _get_json(url)
-            raw_msgs = resp.get("messages", [])
-            transport_used = "relay"
-        except Exception as e:
-            if transport_used == "none":
-                return {"ok": False, "error": str(e)}
+            relay_msgs = resp.get("messages", [])
+            if relay_msgs:
+                raw_msgs.extend(relay_msgs)
+                transports_used.append("relay")
+        except Exception:
+            pass
 
-    if transport_used == "none" and not raw_msgs:
-        return {"ok": False, "error": "no transport configured (need gist_id or relay_url)"}
+    if not raw_msgs and not transports_used:
+        has_any_transport = me.get("endpoint") or me.get("gist_id") or me.get("relay_url")
+        if not has_any_transport:
+            return {"ok": False, "error": "no transport configured (run init with --endpoint or set up a tunnel)"}
+        return {"ok": True, "messages": [], "events": [], "count": 0, "transports": []}
+
     events = []
     verified_msgs = []
+    seen_ids = set()
     for m in raw_msgs:
+        # Deduplicate (same message might arrive via multiple transports)
+        msg_id = m.get("id", "")
+        if msg_id in seen_ids:
+            continue
+        seen_ids.add(msg_id)
+
         # Verify signature if we have the sender's verify_key
         frm = m.get("from", "")
         sig = m.pop("sig", "")
@@ -437,20 +513,19 @@ def pull_messages() -> dict:
             vk = m.get("body", {}).get("verify_key", "")
         if vk and sig:
             if not _verify_ed25519(vk, m, sig):
-                # Signature invalid — skip this message
-                m["sig"] = sig  # restore for logging
+                m["sig"] = sig
                 m["_sig_valid"] = False
                 _append_jsonl(INBOX, m)
                 events.append({"event": "sig_invalid", "from": frm, "message_id": m.get("id")})
                 continue
-        m["sig"] = sig  # restore sig in message
+        m["sig"] = sig
         m["_sig_valid"] = True if (vk and sig) else None
         _append_jsonl(INBOX, m)
         ev = _process_protocol_message(s, m)
         if ev:
             events.append(ev)
         verified_msgs.append(m)
-    return {"ok": True, "messages": verified_msgs, "events": events, "count": len(raw_msgs), "transport": transport_used}
+    return {"ok": True, "messages": verified_msgs, "events": events, "count": len(verified_msgs), "transports": transports_used}
 
 
 def list_peers() -> dict:

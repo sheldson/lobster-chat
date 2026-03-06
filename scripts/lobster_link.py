@@ -103,7 +103,11 @@ def cmd_init(args):
         "pull_token": pull_token,
         "created_at": now_iso(),
     }
-    # Try to create GitHub Gist inbox
+    transports = []
+    # Primary: direct endpoint (P2P)
+    if args.endpoint:
+        transports.append("direct_endpoint")
+    # Fallback: GitHub Gist
     try:
         from github_transport import create_inbox, check_token
         token_check = check_token()
@@ -111,17 +115,27 @@ def cmd_init(args):
             gist_result = create_inbox(args.name)
             if gist_result.get("ok"):
                 me["gist_id"] = gist_result["gist_id"]
+                transports.append("github_gist")
     except Exception:
         pass
-    s["me"] = me
-    s["peers"] = {}
-    save_state(s)
-    if args.relay_url and not me.get("gist_id"):
+    # Fallback: Relay
+    if args.relay_url:
+        transports.append("relay")
         try:
             register_relay(me)
         except Exception:
             pass
-    print(json.dumps({"ok": True, "lobster_id": me["lobster_id"], "name": me["name"], "relay_url": me.get("relay_url")}, ensure_ascii=False))
+    s["me"] = me
+    s["peers"] = {}
+    save_state(s)
+    print(json.dumps({
+        "ok": True,
+        "lobster_id": me["lobster_id"],
+        "name": me["name"],
+        "transports": transports,
+        "endpoint": me.get("endpoint", ""),
+        "gist_id": me.get("gist_id", ""),
+    }, ensure_ascii=False))
     return 0
 
 
@@ -278,7 +292,14 @@ def build_envelope(s, to, intent, body):
 
 
 def deliver_to_peer(peer, envelope):
-    # Priority 1: GitHub Gist
+    # Priority 1: Direct endpoint (P2P via tunnel)
+    if peer.get("endpoint"):
+        try:
+            result = post_json(peer["endpoint"], envelope)
+            return {"ok": True, "delivery": "direct_endpoint"}
+        except Exception:
+            pass
+    # Priority 2: GitHub Gist (fallback)
     if peer.get("gist_id"):
         try:
             from github_transport import send_message as gist_send
@@ -287,13 +308,10 @@ def deliver_to_peer(peer, envelope):
                 return {"ok": True, "delivery": "github_gist"}
         except Exception:
             pass
-    # Priority 2: Relay
+    # Priority 3: Relay
     if peer.get("relay_url"):
         url = peer["relay_url"].rstrip("/") + "/send"
         return post_json(url, {"envelope": envelope})
-    # Priority 3: Direct endpoint
-    if peer.get("endpoint"):
-        return post_json(peer["endpoint"], envelope)
     return {"ok": False, "delivery": "no_transport"}
 
 
@@ -357,18 +375,11 @@ def process_protocol_message(s, msg):
 
 
 def cmd_pull(_args):
-    s = load_state()
-    me = s.get("me")
-    if not me or not me.get("relay_url"):
-        raise SystemExit("relay_url not configured")
-    q = parse.urlencode({"lobster_id": me["lobster_id"], "pull_token": me.get("pull_token", "")})
-    url = me["relay_url"].rstrip("/") + f"/pull?{q}"
-    resp = get_json(url)
-    msgs = resp.get("messages", [])
-    for m in msgs:
-        append_jsonl(INBOX, m)
-        process_protocol_message(s, m)
-    print(json.dumps({"ok": True, "pulled": len(msgs)}, ensure_ascii=False))
+    """Pull messages from all configured transports (local inbox, Gist, relay)."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import lobster_sdk as sdk
+    result = sdk.pull_messages()
+    print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
 
 
@@ -466,6 +477,47 @@ def cmd_list_peers(_args):
     return 0
 
 
+def cmd_start_inbox(args):
+    """Start the local inbox server (blocking)."""
+    from inbox_server import main as inbox_main
+    sys.argv = ["inbox_server", "--host", args.host, "--port", str(args.port)]
+    inbox_main()
+    return 0
+
+
+def cmd_tunnel(args):
+    """Detect or start a tunnel for the inbox server."""
+    from tunnel import detect_tunnel_tool, start_tunnel, get_install_instructions
+    if args.action == "detect":
+        print(json.dumps(detect_tunnel_tool(), indent=2))
+    elif args.action == "start":
+        result = start_tunnel(port=args.port, prefer=args.prefer)
+        if result.get("ok"):
+            # Auto-update endpoint in state
+            s = load_state()
+            if s.get("me"):
+                endpoint = result["public_url"].rstrip("/") + "/lobster/inbox"
+                s["me"]["endpoint"] = endpoint
+                save_state(s)
+                result["endpoint"] = endpoint
+        print(json.dumps(result, indent=2))
+    elif args.action == "instructions":
+        print(get_install_instructions())
+    return 0
+
+
+def cmd_update_endpoint(args):
+    """Update this lobster's public endpoint URL."""
+    s = load_state()
+    me = s.get("me")
+    if not me:
+        raise SystemExit("Not initialized.")
+    me["endpoint"] = args.endpoint
+    save_state(s)
+    print(json.dumps({"ok": True, "endpoint": args.endpoint}, ensure_ascii=False))
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -527,6 +579,21 @@ def main():
 
     p = sub.add_parser("list-peers")
     p.set_defaults(fn=cmd_list_peers)
+
+    p = sub.add_parser("start-inbox", help="Start the local inbox server")
+    p.add_argument("--host", default="0.0.0.0")
+    p.add_argument("--port", type=int, default=8787)
+    p.set_defaults(fn=cmd_start_inbox)
+
+    p = sub.add_parser("tunnel", help="Manage tunnel for public access")
+    p.add_argument("action", choices=["detect", "start", "instructions"])
+    p.add_argument("--port", type=int, default=8787)
+    p.add_argument("--prefer", default="", help="Preferred tunnel tool (ngrok or cloudflared)")
+    p.set_defaults(fn=cmd_tunnel)
+
+    p = sub.add_parser("update-endpoint", help="Update public endpoint URL")
+    p.add_argument("--endpoint", required=True)
+    p.set_defaults(fn=cmd_update_endpoint)
 
     args = ap.parse_args()
     rc = args.fn(args)

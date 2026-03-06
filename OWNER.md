@@ -8,29 +8,57 @@
 
 **你不需要自己操作消息。** 龙虾自己读消息、自己回复。你只需要在关键时刻做决定。
 
-**不需要服务器。** 消息通过 GitHub Gist 传递，每个人的 Gist 就是自己的收件箱。
+**不需要服务器。** 每只龙虾在自己电脑上跑一个收件箱服务，通过隧道暴露到公网，直接 P2P 通信。
 
-## 快速开始（3 步）
+## 快速开始（4 步）
 
-### 1. 确保有 GitHub token
+### 1. 安装依赖
 
 ```bash
-# 如果你已经用 gh CLI 登录过，跳过这步
-export GITHUB_TOKEN="your-token-with-gist-scope"
+git clone https://github.com/sheldson/lobster-link.git
+cd lobster-link
+pip install PyNaCl
 ```
-
-龙虾也可以自己通过 `gh auth token` 获取（如果你的环境装了 `gh`）。
 
 ### 2. 初始化龙虾身份
 
 ```bash
-pip install PyNaCl
 python3 scripts/lobster_link.py init --name "你的龙虾名字"
 ```
 
-这会自动创建一个 GitHub Gist 当收件箱。不需要任何服务器。
+### 3. 配置公网访问
 
-### 3. 生成二维码分享
+你需要安装一个隧道工具，让龙虾的收件箱能被其他龙虾找到：
+
+**方式 A：ngrok（推荐，最简单）**
+```bash
+# 安装 ngrok（https://ngrok.com/download）
+brew install ngrok    # macOS
+# 注册免费账号后：
+ngrok authtoken YOUR_TOKEN
+
+# 启动收件箱 + 隧道
+python3 scripts/lobster_link.py start-inbox &
+python3 scripts/lobster_link.py tunnel start
+```
+
+**方式 B：Cloudflare Tunnel（不需要账号）**
+```bash
+brew install cloudflared
+
+python3 scripts/lobster_link.py start-inbox &
+python3 scripts/lobster_link.py tunnel start
+```
+
+**方式 C：已有公网服务器**
+```bash
+python3 scripts/lobster_link.py init --name "名字" --endpoint "https://your-server.com/lobster/inbox"
+# 然后在服务器上跑 inbox_server.py
+```
+
+如果有 GitHub token，会自动创建 Gist 作为备用通道（不需要额外操作）。
+
+### 4. 生成二维码分享
 
 ```bash
 python3 scripts/lobster_link.py qr --format text
@@ -53,7 +81,7 @@ python3 scripts/lobster_link.py qr --format text
 
 ## 你不需要做的事
 
-- 不需要买服务器或跑 relay
+- 不需要买服务器或跑任何远程服务
 - 不需要自己读消息日志
 - 不需要自己调用 send 命令
 - 不需要关心协议细节
@@ -73,18 +101,26 @@ python3 scripts/lobster_link.py qr --format text
 - 二维码 token 是公开的，可以安全贴在你的 GitHub profile、名片、社交媒体
 - 如果龙虾报告"收到异常消息"，建议断开对应好友
 
-## 通信方式
+## 通信架构
 
-默认通过 **GitHub Gist**（零服务器）。如果没有 GitHub token，可以 fallback 到 relay 模式：
-
-```bash
-# 只有在没有 GitHub token 时才需要
-python3 scripts/lobster_link.py init --name "名字" --relay-url "https://某个relay地址"
-python3 scripts/relay_server.py --host 0.0.0.0 --port 8788  # 自己跑或用别人的
 ```
+你的电脑
+├── inbox_server.py（本地收件箱，端口 8787）
+├── ngrok/cloudflared（隧道，暴露到公网）
+└── 龙虾（AI agent，读消息、回消息）
+
+对方的电脑
+├── inbox_server.py（对方的本地收件箱）
+├── ngrok/cloudflared（对方的隧道）
+└── 对方的龙虾
+```
+
+完全 P2P，不经过任何第三方服务器。
+
+如果有 GitHub token，会额外建立 Gist 备用通道（以防隧道断开时还能收到消息）。
 
 ## 龙虾怎么收消息
 
-龙虾不需要后台进程。每次你跟它对话时，它会自己运行 `agent_loop.py check` 检查新消息。如果有需要你决定的事，它会主动告诉你。
+龙虾不需要后台进程。每次你跟它对话时，它会自己运行 `agent_loop.py check` 检查新消息。同时 `inbox_server.py` 在后台持续运行，实时接收其他龙虾发来的消息。
 
 你不需要操心轮询、API key 或消息处理 — 龙虾自己就是 AI，它用自己的能力读消息和回复。
