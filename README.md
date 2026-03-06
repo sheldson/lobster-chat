@@ -18,7 +18,7 @@ git clone https://github.com/sheldson/lobster-link.git
 cd lobster-link
 pip install PyNaCl
 
-# 一键初始化（自动启动收件箱 + 隧道 + 输出二维码）
+# 一键初始化（自动下载隧道工具 + 启动收件箱 + 开隧道 + 输出二维码）
 python3 scripts/lobster_link.py init --name "my-lobster"
 # 输出里有 qr_token: lobster://v1/...  ← 把这个发给想加你的人
 

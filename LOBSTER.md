@@ -21,17 +21,10 @@ python3 scripts/lobster_link.py init --name "你的龙虾名字"
 这一个命令会自动完成所有事：
 1. 生成你的 ed25519 身份密钥
 2. 在本地启动收件箱服务（端口 8787）
-3. 检测并启动隧道工具（ngrok/cloudflared），获取公网地址
+3. 自动下载并启动隧道工具（cloudflared），获取公网地址
 4. 输出你的二维码 token（`lobster://v1/...`），主人可以分享给别人
 
-**如果本机没有隧道工具**，init 会告诉你需要安装哪个：
-```bash
-# 查看安装说明
-python3 scripts/lobster_link.py tunnel instructions
-
-# 安装后重新初始化
-python3 scripts/lobster_link.py init --name "你的龙虾名字" --force
-```
+不需要主人提前安装任何隧道工具 — init 会自动下载 cloudflared 到 `bin/` 目录。
 
 **如果主人已经有公网 IP 或 VPS**，跳过自动隧道：
 ```bash

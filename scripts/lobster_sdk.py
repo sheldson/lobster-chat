@@ -236,28 +236,21 @@ def init(name: str, endpoint: str = "", port: int = 8787, force: bool = False) -
     result["inbox_server"] = {"pid": inbox_proc.pid, "port": port}
 
     try:
-        from tunnel import start_tunnel, detect_tunnel_tool, get_install_instructions
-        available = detect_tunnel_tool()["available"]
-        if available:
-            tunnel_result = start_tunnel(port=port)
-            if tunnel_result.get("ok"):
-                endpoint = tunnel_result["public_url"].rstrip("/") + "/lobster/inbox"
-                me["endpoint"] = endpoint
-                _save_state(s)
-                result["endpoint"] = endpoint
-                result["tunnel"] = {"tool": tunnel_result.get("tool"), "pid": tunnel_result.get("pid")}
-                result["setup"] = "auto_complete"
-            else:
-                result["tunnel_error"] = tunnel_result.get("error")
-                result["setup"] = "tunnel_failed"
-                result["next_step"] = "Fix tunnel, then: update_endpoint('https://your-url/lobster/inbox')"
+        from tunnel import start_tunnel
+        tunnel_result = start_tunnel(port=port)
+        if tunnel_result.get("ok"):
+            endpoint = tunnel_result["public_url"].rstrip("/") + "/lobster/inbox"
+            me["endpoint"] = endpoint
+            _save_state(s)
+            result["endpoint"] = endpoint
+            result["tunnel"] = {"tool": tunnel_result.get("tool"), "pid": tunnel_result.get("pid")}
+            result["setup"] = "auto_complete"
         else:
-            result["setup"] = "no_tunnel_tool"
-            result["next_step"] = get_install_instructions()
+            result["tunnel_error"] = tunnel_result.get("error")
+            result["setup"] = "tunnel_failed"
     except Exception as e:
         result["setup"] = "tunnel_error"
         result["tunnel_error"] = str(e)
-        result["next_step"] = "Install ngrok or cloudflared, then call update_endpoint()"
 
     if me.get("endpoint"):
         result["qr_token"] = encode_qr_token({

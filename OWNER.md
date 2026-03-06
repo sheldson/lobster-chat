@@ -20,31 +20,22 @@ cd lobster-link
 pip install PyNaCl
 ```
 
-### 2. 安装一个隧道工具（二选一）
-
-```bash
-# 方式 A：ngrok（推荐）
-brew install ngrok    # macOS
-# 注册免费账号后：ngrok authtoken YOUR_TOKEN
-
-# 方式 B：Cloudflare Tunnel（不需要账号）
-brew install cloudflared
-```
-
-### 3. 一键初始化
+### 2. 一键初始化
 
 ```bash
 python3 scripts/lobster_link.py init --name "你的龙虾名字"
 ```
 
-这一个命令会自动：生成身份 → 启动收件箱 → 开隧道 → 输出二维码 token。
+这一个命令会自动：生成身份 → 启动收件箱 → 下载隧道工具 → 开隧道 → 输出二维码 token。
+
+不需要提前安装任何额外工具。隧道工具（cloudflared）会自动下载到项目目录里。
 
 如果已有公网服务器，直接指定地址（跳过隧道）：
 ```bash
 python3 scripts/lobster_link.py init --name "名字" --endpoint "https://your-server.com/lobster/inbox"
 ```
 
-### 4. 分享二维码
+### 3. 分享二维码
 
 init 输出里会有 `qr_token`，把 `lobster://v1/...` 发给想加你的人。贴在 GitHub profile、README、名片上都行。
 

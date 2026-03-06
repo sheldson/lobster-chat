@@ -1,31 +1,105 @@
 #!/usr/bin/env python3
 """
-Tunnel helper — detect and launch a public tunnel for the lobster's inbox server.
+Tunnel helper — detect, auto-download, and launch a public tunnel.
+
+On init, if no tunnel tool is found on the machine, this module automatically
+downloads cloudflared (a single binary, no account needed) into bin/ and uses it.
 
 Supports:
-    1. ngrok (ngrok http 8787)
-    2. Cloudflare Tunnel (cloudflared tunnel --url http://localhost:8787)
-
-The lobster runs this at init to get a stable public URL.
-If no tunnel tool is available, prints instructions for the owner.
+    1. cloudflared (auto-downloaded if missing, free quick tunnels, no signup)
+    2. ngrok (if already installed)
 """
 import json
 import os
+import platform
 import shutil
+import stat
 import subprocess
 import sys
 import time
+from pathlib import Path
 from urllib import request as urllib_request
+
+ROOT = Path(__file__).resolve().parents[1]
+BIN = ROOT / "bin"
+
+# cloudflared download URLs by platform
+_CLOUDFLARED_URLS = {
+    ("Linux", "x86_64"):  "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64",
+    ("Linux", "aarch64"): "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64",
+    ("Linux", "armv7l"):  "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm",
+    ("Darwin", "x86_64"): "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-amd64.tgz",
+    ("Darwin", "arm64"):  "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-amd64.tgz",
+}
+
+
+def _local_cloudflared() -> str:
+    """Return path to local cloudflared binary in bin/, or empty string."""
+    name = "cloudflared.exe" if sys.platform == "win32" else "cloudflared"
+    path = BIN / name
+    if path.exists() and os.access(str(path), os.X_OK):
+        return str(path)
+    return ""
 
 
 def detect_tunnel_tool() -> dict:
-    """Detect which tunnel tool is available on this machine."""
+    """Detect which tunnel tool is available (system-wide or local bin/)."""
     tools = []
     if shutil.which("ngrok"):
         tools.append("ngrok")
-    if shutil.which("cloudflared"):
+    if shutil.which("cloudflared") or _local_cloudflared():
         tools.append("cloudflared")
     return {"available": tools}
+
+
+def _download_cloudflared() -> dict:
+    """Download cloudflared binary to bin/. Returns {"ok": True, "path": ...} or error."""
+    system = platform.system()
+    machine = platform.machine()
+    key = (system, machine)
+
+    if key not in _CLOUDFLARED_URLS:
+        return {"ok": False, "error": f"No cloudflared binary for {system}/{machine}. Install manually."}
+
+    url = _CLOUDFLARED_URLS[key]
+    BIN.mkdir(parents=True, exist_ok=True)
+    dest = BIN / "cloudflared"
+
+    try:
+        print(f"Downloading cloudflared for {system}/{machine}...")
+        if url.endswith(".tgz"):
+            # macOS comes as .tgz
+            import tarfile
+            import tempfile
+            tmp = Path(tempfile.mktemp(suffix=".tgz"))
+            urllib_request.urlretrieve(url, str(tmp))
+            with tarfile.open(str(tmp), "r:gz") as tar:
+                for member in tar.getmembers():
+                    if member.name.endswith("cloudflared") or member.name == "cloudflared":
+                        member.name = "cloudflared"
+                        tar.extract(member, str(BIN))
+                        break
+            tmp.unlink(missing_ok=True)
+        else:
+            # Linux: direct binary
+            urllib_request.urlretrieve(url, str(dest))
+
+        # Make executable
+        dest.chmod(dest.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+        print(f"cloudflared downloaded to {dest}")
+        return {"ok": True, "path": str(dest)}
+    except Exception as e:
+        return {"ok": False, "error": f"Download failed: {e}"}
+
+
+def _get_cloudflared_cmd() -> str:
+    """Get cloudflared command — system-wide or local."""
+    if shutil.which("cloudflared"):
+        return "cloudflared"
+    local = _local_cloudflared()
+    if local:
+        return local
+    return ""
 
 
 def _wait_for_ngrok_url(timeout: int = 15) -> str:
@@ -67,24 +141,25 @@ def start_ngrok(port: int = 8787) -> dict:
 
 def start_cloudflared(port: int = 8787) -> dict:
     """Start cloudflared quick tunnel and return the public URL."""
+    cmd = _get_cloudflared_cmd()
+    if not cmd:
+        return {"ok": False, "error": "cloudflared not found"}
     try:
         proc = subprocess.Popen(
-            ["cloudflared", "tunnel", "--url", f"http://localhost:{port}"],
+            [cmd, "tunnel", "--url", f"http://localhost:{port}"],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
         )
-        # cloudflared prints the URL to stderr/stdout
-        deadline = time.time() + 20
+        deadline = time.time() + 30
         url = ""
         while time.time() < deadline:
             line = proc.stdout.readline()
             if not line:
                 break
-            # Look for the trycloudflare.com URL
-            if ".trycloudflare.com" in line or "https://" in line:
+            if ".trycloudflare.com" in line:
                 for word in line.split():
-                    if word.startswith("https://") and ("trycloudflare.com" in word or "cloudflare" in word.lower()):
+                    if word.startswith("https://") and "trycloudflare.com" in word:
                         url = word.rstrip("/.,;")
                         break
                 if url:
@@ -93,27 +168,31 @@ def start_cloudflared(port: int = 8787) -> dict:
             proc.terminate()
             return {"ok": False, "error": "cloudflared started but no public URL found"}
         return {"ok": True, "public_url": url, "pid": proc.pid, "tool": "cloudflared"}
-    except FileNotFoundError:
-        return {"ok": False, "error": "cloudflared not found"}
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
 
 def start_tunnel(port: int = 8787, prefer: str = "") -> dict:
-    """Auto-detect and start a tunnel. Returns {"ok": True, "public_url": "..."} or error.
+    """Auto-detect and start a tunnel. Auto-downloads cloudflared if nothing found.
 
     Args:
         port: Local port the inbox server listens on.
         prefer: Preferred tool ("ngrok" or "cloudflared"). Auto-detects if empty.
     """
     available = detect_tunnel_tool()["available"]
+
+    # Nothing found? Auto-download cloudflared
     if not available:
-        return {
-            "ok": False,
-            "error": "no_tunnel_tool",
-            "message": "No tunnel tool found. Install one of: ngrok (https://ngrok.com), cloudflared (https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/)",
-            "manual_option": "If you already have a public URL (VPS, port forwarding, etc.), pass it directly: --endpoint https://your-url/lobster/inbox",
-        }
+        dl = _download_cloudflared()
+        if dl.get("ok"):
+            available = ["cloudflared"]
+        else:
+            return {
+                "ok": False,
+                "error": "no_tunnel_tool",
+                "download_error": dl.get("error"),
+                "manual_option": "Pass --endpoint https://your-url/lobster/inbox if you have a public server",
+            }
 
     tool = prefer if prefer in available else available[0]
     if tool == "ngrok":
@@ -123,29 +202,10 @@ def start_tunnel(port: int = 8787, prefer: str = "") -> dict:
     return {"ok": False, "error": f"unknown tool: {tool}"}
 
 
-def get_install_instructions() -> str:
-    """Return human-readable install instructions for tunnel tools."""
-    return """To make your lobster reachable from the internet, install ONE of these:
-
-Option 1: ngrok (recommended, easiest)
-    brew install ngrok    # macOS
-    # or download from https://ngrok.com/download
-    ngrok authtoken YOUR_TOKEN  # one-time setup, free account
-
-Option 2: Cloudflare Tunnel (no account needed for quick tunnels)
-    brew install cloudflared    # macOS
-    # or download from https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/
-
-Option 3: Manual
-    If you have a VPS or can port-forward, just pass your public URL:
-    python3 scripts/lobster_link.py init --name "my-lobster" --endpoint "https://your-server.com/lobster/inbox"
-"""
-
-
 if __name__ == "__main__":
     import argparse
     ap = argparse.ArgumentParser(description="Tunnel helper for lobster inbox")
-    ap.add_argument("command", choices=["detect", "start", "instructions"])
+    ap.add_argument("command", choices=["detect", "start"])
     ap.add_argument("--port", type=int, default=8787)
     ap.add_argument("--prefer", default="", help="Preferred tunnel tool")
     args = ap.parse_args()
@@ -155,5 +215,3 @@ if __name__ == "__main__":
     elif args.command == "start":
         result = start_tunnel(port=args.port, prefer=args.prefer)
         print(json.dumps(result, indent=2))
-    elif args.command == "instructions":
-        print(get_install_instructions())
