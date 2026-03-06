@@ -80,17 +80,26 @@ def _download_cloudflared() -> dict:
     try:
         print(f"Downloading cloudflared for {system}/{machine}...")
         if url.endswith(".tgz"):
-            # macOS comes as .tgz
+            # macOS comes as .tgz — extract safely to prevent path traversal
             import tarfile
             import tempfile
             tmp = Path(tempfile.mktemp(suffix=".tgz"))
             urllib_request.urlretrieve(url, str(tmp))
             with tarfile.open(str(tmp), "r:gz") as tar:
                 for member in tar.getmembers():
-                    if member.name.endswith("cloudflared") or member.name == "cloudflared":
-                        member.name = "cloudflared"
-                        tar.extract(member, str(BIN))
-                        break
+                    basename = os.path.basename(member.name)
+                    if basename != "cloudflared":
+                        continue
+                    # Reject symlinks, hardlinks, and devices
+                    if not member.isreg():
+                        continue
+                    # Safe extraction: read file data and write directly
+                    src = tar.extractfile(member)
+                    if src is None:
+                        continue
+                    with open(str(dest), "wb") as out_f:
+                        out_f.write(src.read())
+                    break
             tmp.unlink(missing_ok=True)
         else:
             # Linux direct binary or Windows .exe
