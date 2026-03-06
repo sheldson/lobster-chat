@@ -124,7 +124,7 @@ def main():
     ap.add_argument("--qr", default="", help="optional QR PNG path (default: data/my-lobster-qr.png)")
     args = ap.parse_args()
 
-    # Resolve owner name: CLI arg > state.json lobster name > "Lobster"
+    # Resolve owner name: CLI arg > state.json lobster name > error
     owner = args.owner
     if not owner:
         state_file = DATA / "state.json"
@@ -136,7 +136,7 @@ def main():
             except Exception:
                 pass
     if not owner:
-        owner = "Lobster"
+        raise SystemExit("--owner is required (or init first so state.json has a name)")
 
     qr_path = Path(args.qr).expanduser() if args.qr else (DATA / "my-lobster-qr.png")
     out = DATA / "my-lobster-qr-card.png"
