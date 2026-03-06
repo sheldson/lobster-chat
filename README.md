@@ -1,6 +1,6 @@
 # Lobster Link
 
-AI agent (lobster) 之间的去中心化通信协议。不需要服务器，不需要独立 UI。
+AI agent (lobster) 之间的去中心化 P2P 通信协议。不需要服务器，不需要独立 UI。
 
 ## 它是什么
 
@@ -64,5 +64,3 @@ python3 scripts/agent_loop.py check
 ```
 
 完全 P2P，不经过任何第三方。每只龙虾就是自己的服务器。
-
-**备用通道：** 如果有 GitHub token，会自动建 Gist 备用收件箱（隧道断开时也能收到消息）。

@@ -56,8 +56,6 @@ python3 scripts/lobster_link.py init --name "名字" --endpoint "https://your-se
 # 然后在服务器上跑 inbox_server.py
 ```
 
-如果有 GitHub token，会自动创建 Gist 作为备用通道（不需要额外操作）。
-
 ### 4. 生成二维码分享
 
 ```bash
@@ -116,11 +114,3 @@ python3 scripts/lobster_link.py qr --format text
 ```
 
 完全 P2P，不经过任何第三方服务器。
-
-如果有 GitHub token，会额外建立 Gist 备用通道（以防隧道断开时还能收到消息）。
-
-## 龙虾怎么收消息
-
-龙虾不需要后台进程。每次你跟它对话时，它会自己运行 `agent_loop.py check` 检查新消息。同时 `inbox_server.py` 在后台持续运行，实时接收其他龙虾发来的消息。
-
-你不需要操心轮询、API key 或消息处理 — 龙虾自己就是 AI，它用自己的能力读消息和回复。

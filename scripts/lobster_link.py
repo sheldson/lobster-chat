@@ -65,24 +65,6 @@ def post_json(url, payload):
     return json.loads(raw) if raw else {"ok": True}
 
 
-def get_json(url):
-    with request.urlopen(url, timeout=12) as resp:
-        raw = resp.read().decode("utf-8")
-    return json.loads(raw) if raw else {}
-
-
-def register_relay(me):
-    if not me.get("relay_url"):
-        return
-    url = me["relay_url"].rstrip("/") + "/register"
-    post_json(url, {
-        "lobster_id": me["lobster_id"],
-        "name": me["name"],
-        "pull_token": me.get("pull_token", ""),
-        "verify_key": me.get("verify_key", ""),
-    })
-
-
 def cmd_init(args):
     s = load_state()
     if s.get("me") and not args.force:
@@ -91,40 +73,14 @@ def cmd_init(args):
     sk = SigningKey.generate()
     signing_key_b64 = base64.urlsafe_b64encode(bytes(sk)).decode("utf-8")
     verify_key_b64 = base64.urlsafe_b64encode(bytes(sk.verify_key)).decode("utf-8")
-    pull_token = uuid.uuid4().hex
     me = {
         "lobster_id": str(uuid.uuid4()),
         "name": args.name,
         "endpoint": args.endpoint,
-        "relay_url": args.relay_url,
-        "gist_id": "",
         "signing_key": signing_key_b64,
         "verify_key": verify_key_b64,
-        "pull_token": pull_token,
         "created_at": now_iso(),
     }
-    transports = []
-    # Primary: direct endpoint (P2P)
-    if args.endpoint:
-        transports.append("direct_endpoint")
-    # Fallback: GitHub Gist
-    try:
-        from github_transport import create_inbox, check_token
-        token_check = check_token()
-        if token_check.get("ok"):
-            gist_result = create_inbox(args.name)
-            if gist_result.get("ok"):
-                me["gist_id"] = gist_result["gist_id"]
-                transports.append("github_gist")
-    except Exception:
-        pass
-    # Fallback: Relay
-    if args.relay_url:
-        transports.append("relay")
-        try:
-            register_relay(me)
-        except Exception:
-            pass
     s["me"] = me
     s["peers"] = {}
     save_state(s)
@@ -132,9 +88,7 @@ def cmd_init(args):
         "ok": True,
         "lobster_id": me["lobster_id"],
         "name": me["name"],
-        "transports": transports,
         "endpoint": me.get("endpoint", ""),
-        "gist_id": me.get("gist_id", ""),
     }, ensure_ascii=False))
     return 0
 
@@ -147,9 +101,7 @@ def public_qr_payload(s):
         "v": 1,
         "lobster_id": me["lobster_id"],
         "name": me["name"],
-        "gist_id": me.get("gist_id", ""),
         "endpoint": me.get("endpoint"),
-        "relay_url": me.get("relay_url"),
         "verify_key": me.get("verify_key", ""),
     }
 
@@ -207,20 +159,16 @@ def cmd_add_peer(args):
     peer_info = {
         "lobster_id": pid,
         "name": p.get("name", args.label or "peer"),
-        "gist_id": p.get("gist_id", ""),
         "endpoint": p.get("endpoint"),
-        "relay_url": p.get("relay_url"),
         "verify_key": p.get("verify_key", ""),
         "status": "pending_sent",
         "created_at": now_iso(),
     }
     s["peers"][pid] = peer_info
     save_state(s)
-    # Send friend_request to the peer via relay/endpoint
+    # Send friend_request to the peer via direct endpoint
     env = build_envelope(s, pid, "friend_request", {
         "name": me["name"],
-        "gist_id": me.get("gist_id", ""),
-        "relay_url": me.get("relay_url", ""),
         "endpoint": me.get("endpoint", ""),
         "verify_key": me.get("verify_key", ""),
     })
@@ -292,26 +240,9 @@ def build_envelope(s, to, intent, body):
 
 
 def deliver_to_peer(peer, envelope):
-    # Priority 1: Direct endpoint (P2P via tunnel)
+    """Deliver a message to a peer via their direct endpoint."""
     if peer.get("endpoint"):
-        try:
-            result = post_json(peer["endpoint"], envelope)
-            return {"ok": True, "delivery": "direct_endpoint"}
-        except Exception:
-            pass
-    # Priority 2: GitHub Gist (fallback)
-    if peer.get("gist_id"):
-        try:
-            from github_transport import send_message as gist_send
-            result = gist_send(peer["gist_id"], envelope)
-            if result.get("ok"):
-                return {"ok": True, "delivery": "github_gist"}
-        except Exception:
-            pass
-    # Priority 3: Relay
-    if peer.get("relay_url"):
-        url = peer["relay_url"].rstrip("/") + "/send"
-        return post_json(url, {"envelope": envelope})
+        return post_json(peer["endpoint"], envelope)
     return {"ok": False, "delivery": "no_transport"}
 
 
@@ -343,9 +274,7 @@ def process_protocol_message(s, msg):
         s["peers"][frm] = {
             "lobster_id": frm,
             "name": body.get("name", "unknown"),
-            "gist_id": body.get("gist_id", ""),
             "endpoint": body.get("endpoint", ""),
-            "relay_url": body.get("relay_url", ""),
             "verify_key": body.get("verify_key", ""),
             "status": "pending_received",
             "created_at": now_iso(),
@@ -375,7 +304,7 @@ def process_protocol_message(s, msg):
 
 
 def cmd_pull(_args):
-    """Pull messages from all configured transports (local inbox, Gist, relay)."""
+    """Pull messages from local inbox."""
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import lobster_sdk as sdk
     result = sdk.pull_messages()
@@ -525,7 +454,6 @@ def main():
     p = sub.add_parser("init")
     p.add_argument("--name", required=True)
     p.add_argument("--endpoint", required=False, default="")
-    p.add_argument("--relay-url", required=False, default="")
     p.add_argument("--force", action="store_true")
     p.set_defaults(fn=cmd_init)
 
