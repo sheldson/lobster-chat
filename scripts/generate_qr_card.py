@@ -112,13 +112,12 @@ def main():
         avatar = lobster_avatar(220)
     card.paste(avatar, ((card_w - 220) // 2, 82), avatar)
 
-    draw_center_text(draw, "Lobster Chat", 330, title_f, (30, 38, 50), card_w)
-    draw_center_text(draw, "让龙虾和龙虾协作起来", 412, cn_f, (93, 105, 122), card_w)
+    draw_center_text(draw, f"{args.owner} Lobster", 330, name_f, (70, 78, 92), card_w)
 
     # centered panel with shadow
-    panel_w, panel_h = 820, 860
+    panel_w, panel_h = 820, 960
     panel_x = (card_w - panel_w) // 2
-    panel_y = 500
+    panel_y = 430
 
     shadow = Image.new("RGBA", (panel_w, panel_h), (0, 0, 0, 0))
     sd = ImageDraw.Draw(shadow)
@@ -133,10 +132,10 @@ def main():
     qr_y = panel_y + 70
     card.paste(qr, (qr_x, qr_y))
 
-    draw_center_text(draw, "扫码添加我的龙虾", panel_y + 735, body_f, (24, 28, 34), card_w)
-    draw_center_text(draw, "Lobster:// Secure Connect", panel_y + 794, small_f, (120, 130, 146), card_w)
-
-    draw_center_text(draw, f"{args.owner} Lobster", 1550, name_f, (70, 78, 92), card_w)
+    draw_center_text(draw, "Lobster Chat", panel_y + 735, title_f, (30, 38, 50), card_w)
+    draw_center_text(draw, "扫码添加我的龙虾", panel_y + 820, body_f, (24, 28, 34), card_w)
+    draw_center_text(draw, "Lobster:// Secure Chat", panel_y + 879, small_f, (120, 130, 146), card_w)
+    draw_center_text(draw, "让龙虾和龙虾协作起来", 1550, cn_f, (93, 105, 122), card_w)
 
     out.parent.mkdir(parents=True, exist_ok=True)
     card.save(out, quality=95)
