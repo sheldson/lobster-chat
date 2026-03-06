@@ -2,13 +2,14 @@
 import argparse
 import base64
 import datetime as dt
-import hashlib
-import hmac
 import json
 import sys
 import uuid
 from pathlib import Path
 from urllib import request, parse
+
+from nacl.signing import SigningKey
+
 
 ROOT = Path(__file__).resolve().parents[1]
 DATA = ROOT / "data"
@@ -48,9 +49,12 @@ def append_jsonl(path, obj):
         f.write(json.dumps(obj, ensure_ascii=False) + "\n")
 
 
-def sign(me_secret, payload_obj):
+def sign_ed25519(signing_key_b64, payload_obj):
+    sk_bytes = base64.urlsafe_b64decode(signing_key_b64)
+    sk = SigningKey(sk_bytes)
     msg = json.dumps(payload_obj, ensure_ascii=False, sort_keys=True).encode("utf-8")
-    return hmac.new(me_secret.encode("utf-8"), msg, hashlib.sha256).hexdigest()
+    signed = sk.sign(msg)
+    return base64.urlsafe_b64encode(signed.signature).decode("utf-8")
 
 
 def post_json(url, payload):
@@ -61,45 +65,78 @@ def post_json(url, payload):
     return json.loads(raw) if raw else {"ok": True}
 
 
-def get_json(url):
-    with request.urlopen(url, timeout=12) as resp:
-        raw = resp.read().decode("utf-8")
-    return json.loads(raw) if raw else {}
-
-
-def register_relay(me):
-    if not me.get("relay_url"):
-        return
-    url = me["relay_url"].rstrip("/") + "/register"
-    post_json(url, {"lobster_id": me["lobster_id"], "name": me["name"], "pull_token": me.get("pull_token", "")})
-
-
 def cmd_init(args):
     s = load_state()
     if s.get("me") and not args.force:
         print("Already initialized. Use --force to reset.")
         return 1
-    secret = uuid.uuid4().hex + uuid.uuid4().hex
-    pull_token = uuid.uuid4().hex
+    sk = SigningKey.generate()
+    signing_key_b64 = base64.urlsafe_b64encode(bytes(sk)).decode("utf-8")
+    verify_key_b64 = base64.urlsafe_b64encode(bytes(sk.verify_key)).decode("utf-8")
     me = {
         "lobster_id": str(uuid.uuid4()),
         "name": args.name,
         "endpoint": args.endpoint,
-        "relay_url": args.relay_url,
         "repo_url": args.repo_url,
         "install_hint": args.install_hint,
-        "secret": secret,
-        "pull_token": pull_token,
+        "signing_key": signing_key_b64,
+        "verify_key": verify_key_b64,
         "created_at": now_iso(),
     }
     s["me"] = me
     s["peers"] = {}
     save_state(s)
+
+    result = {
+        "ok": True,
+        "lobster_id": me["lobster_id"],
+        "name": me["name"],
+        "endpoint": me.get("endpoint", ""),
+    }
+
+    # If endpoint already provided (e.g. VPS), skip auto-setup
+    if args.endpoint:
+        result["setup"] = "endpoint_provided"
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
+
+    # Auto-setup: start inbox server + tunnel
+    import subprocess as _sp
+    import threading
+
+    # Step 1: Start inbox server in background
+    port = args.port
+    inbox_proc = _sp.Popen(
+        [sys.executable, str(ROOT / "scripts" / "inbox_server.py"), "--port", str(port)],
+        stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
+    )
+    result["inbox_server"] = {"pid": inbox_proc.pid, "port": port}
+
+    # Step 2: Start tunnel (auto-downloads cloudflared if nothing found)
     try:
-        register_relay(me)
-    except Exception:
-        pass
-    print(json.dumps({"ok": True, "lobster_id": me["lobster_id"], "name": me["name"], "relay_url": me.get("relay_url")}, ensure_ascii=False))
+        from tunnel import start_tunnel
+        tunnel_result = start_tunnel(port=port)
+        if tunnel_result.get("ok"):
+            endpoint = tunnel_result["public_url"].rstrip("/") + "/lobster/inbox"
+            me["endpoint"] = endpoint
+            save_state(s)
+            result["endpoint"] = endpoint
+            result["tunnel"] = {"tool": tunnel_result.get("tool"), "pid": tunnel_result.get("pid")}
+            result["setup"] = "auto_complete"
+        else:
+            result["tunnel_error"] = tunnel_result.get("error", "unknown")
+            result["setup"] = "tunnel_failed"
+            result["next_step"] = "Run: python3 scripts/lobster_link.py tunnel start"
+    except Exception as e:
+        result["setup"] = "tunnel_error"
+        result["tunnel_error"] = str(e)
+
+    # Step 3: Generate QR token if endpoint is ready
+    if me.get("endpoint"):
+        payload = public_qr_payload(s)
+        result["qr_token"] = encode_qr_token(payload)
+
+    print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
 
 
@@ -114,10 +151,9 @@ def public_qr_payload(s):
         "lobster_id": me["lobster_id"],
         "name": me["name"],
         "endpoint": me.get("endpoint"),
-        "relay_url": me.get("relay_url"),
         "repo_url": repo_url,
         "install_hint": install_hint,
-        "public_key": "mvp-no-ed25519",
+        "verify_key": me.get("verify_key", ""),
     }
 
 
@@ -175,17 +211,17 @@ def cmd_add_peer(args):
         "lobster_id": pid,
         "name": p.get("name", args.label or "peer"),
         "endpoint": p.get("endpoint"),
-        "relay_url": p.get("relay_url"),
+        "verify_key": p.get("verify_key", ""),
         "status": "pending_sent",
         "created_at": now_iso(),
     }
     s["peers"][pid] = peer_info
     save_state(s)
-    # Send friend_request to the peer via relay/endpoint
+    # Send friend_request to the peer via direct endpoint
     env = build_envelope(s, pid, "friend_request", {
         "name": me["name"],
-        "relay_url": me.get("relay_url", ""),
         "endpoint": me.get("endpoint", ""),
+        "verify_key": me.get("verify_key", ""),
     })
     append_jsonl(OUTBOX, env)
     try:
@@ -255,17 +291,15 @@ def build_envelope(s, to, intent, body):
         "intent": intent,
         "body": body,
     }
-    payload["sig"] = sign(me["secret"], payload)
+    payload["sig"] = sign_ed25519(me["signing_key"], payload)
     return payload
 
 
 def deliver_to_peer(peer, envelope):
-    if peer.get("relay_url"):
-        url = peer["relay_url"].rstrip("/") + "/send"
-        return post_json(url, {"envelope": envelope})
+    """Deliver a message to a peer via their direct endpoint."""
     if peer.get("endpoint"):
         return post_json(peer["endpoint"], envelope)
-    return {"ok": True, "delivery": "queued_only"}
+    return {"ok": False, "delivery": "no_transport"}
 
 
 def cmd_send(args):
@@ -291,13 +325,21 @@ def process_protocol_message(s, msg):
     body = msg.get("body", {})
 
     if intent == "friend_request":
-        if frm in s["peers"] and s["peers"][frm]["status"] == "active":
-            return  # already friends
+        existing = s["peers"].get(frm)
+        if existing:
+            status = existing["status"]
+            if status in ("active", "rejected", "blocked", "pending_received"):
+                return  # don't overwrite
+            if status == "pending_sent":
+                existing["status"] = "active"
+                existing["approved_at"] = now_iso()
+                save_state(s)
+                return
         s["peers"][frm] = {
             "lobster_id": frm,
             "name": body.get("name", "unknown"),
             "endpoint": body.get("endpoint", ""),
-            "relay_url": body.get("relay_url", ""),
+            "verify_key": body.get("verify_key", ""),
             "status": "pending_received",
             "created_at": now_iso(),
         }
@@ -326,18 +368,11 @@ def process_protocol_message(s, msg):
 
 
 def cmd_pull(_args):
-    s = load_state()
-    me = s.get("me")
-    if not me or not me.get("relay_url"):
-        raise SystemExit("relay_url not configured")
-    q = parse.urlencode({"lobster_id": me["lobster_id"], "pull_token": me.get("pull_token", "")})
-    url = me["relay_url"].rstrip("/") + f"/pull?{q}"
-    resp = get_json(url)
-    msgs = resp.get("messages", [])
-    for m in msgs:
-        append_jsonl(INBOX, m)
-        process_protocol_message(s, m)
-    print(json.dumps({"ok": True, "pulled": len(msgs)}, ensure_ascii=False))
+    """Pull messages from local inbox."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import lobster_sdk as sdk
+    result = sdk.pull_messages()
+    print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
 
 
@@ -435,16 +470,55 @@ def cmd_list_peers(_args):
     return 0
 
 
+def cmd_start_inbox(args):
+    """Start the local inbox server (blocking)."""
+    from inbox_server import main as inbox_main
+    sys.argv = ["inbox_server", "--host", args.host, "--port", str(args.port)]
+    inbox_main()
+    return 0
+
+
+def cmd_tunnel(args):
+    """Detect or start a tunnel for the inbox server."""
+    from tunnel import detect_tunnel_tool, start_tunnel
+    if args.action == "detect":
+        print(json.dumps(detect_tunnel_tool(), indent=2))
+    elif args.action == "start":
+        result = start_tunnel(port=args.port, prefer=args.prefer)
+        if result.get("ok"):
+            # Auto-update endpoint in state
+            s = load_state()
+            if s.get("me"):
+                endpoint = result["public_url"].rstrip("/") + "/lobster/inbox"
+                s["me"]["endpoint"] = endpoint
+                save_state(s)
+                result["endpoint"] = endpoint
+        print(json.dumps(result, indent=2))
+    return 0
+
+
+def cmd_update_endpoint(args):
+    """Update this lobster's public endpoint URL."""
+    s = load_state()
+    me = s.get("me")
+    if not me:
+        raise SystemExit("Not initialized.")
+    me["endpoint"] = args.endpoint
+    save_state(s)
+    print(json.dumps({"ok": True, "endpoint": args.endpoint}, ensure_ascii=False))
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("init")
     p.add_argument("--name", required=True)
-    p.add_argument("--endpoint", required=False, default="")
-    p.add_argument("--relay-url", required=False, default="")
+    p.add_argument("--endpoint", required=False, default="", help="Public URL if you already have one (skips auto tunnel)")
     p.add_argument("--repo-url", required=False, default="https://github.com/sheldson/lobster-chat")
     p.add_argument("--install-hint", required=False, default="git clone https://github.com/sheldson/lobster-chat.git && cd lobster-chat && ./scripts/install.sh")
+    p.add_argument("--port", type=int, default=8787, help="Local inbox server port")
     p.add_argument("--force", action="store_true")
     p.set_defaults(fn=cmd_init)
 
@@ -498,6 +572,21 @@ def main():
 
     p = sub.add_parser("list-peers")
     p.set_defaults(fn=cmd_list_peers)
+
+    p = sub.add_parser("start-inbox", help="Start the local inbox server")
+    p.add_argument("--host", default="127.0.0.1")
+    p.add_argument("--port", type=int, default=8787)
+    p.set_defaults(fn=cmd_start_inbox)
+
+    p = sub.add_parser("tunnel", help="Manage tunnel for public access")
+    p.add_argument("action", choices=["detect", "start"])
+    p.add_argument("--port", type=int, default=8787)
+    p.add_argument("--prefer", default="", help="Preferred tunnel tool (ngrok or cloudflared)")
+    p.set_defaults(fn=cmd_tunnel)
+
+    p = sub.add_parser("update-endpoint", help="Update public endpoint URL")
+    p.add_argument("--endpoint", required=True)
+    p.set_defaults(fn=cmd_update_endpoint)
 
     args = ap.parse_args()
     rc = args.fn(args)

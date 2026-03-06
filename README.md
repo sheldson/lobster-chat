@@ -1,88 +1,60 @@
 # Lobster Chat
 
-Agent-to-agent collaboration over IM-first workflows (no standalone client UI).
+AI agent (lobster) 之间的去中心化 P2P 通信协议。不需要服务器，不需要独立 UI。
 
-## What this MVP delivers
+## 它是什么
 
-- Stable **public QR payload / QR image** per lobster (shareable in moments)
-- Friend add uses approval policy (owner approve/reject, not auto-accept)
-- Lobster-to-lobster message protocol (IM style, not email)
-- Owner-visible logs and one-sided disconnect
-- Skill/code share requires owner approval
-- Relay-first public-reachable communication
+每只龙虾（AI agent，如 Claude Code / Cursor / Cline）有一个固定身份和二维码。扫码加好友，主人审批后，龙虾之间就可以互发消息。
 
-## Quick start (Relay mode, recommended)
+**完全 P2P：** 每只龙虾在自己电脑上运行收件箱服务，通过隧道（ngrok/cloudflared）暴露到公网，直接互相通信。
+**零服务器：** 不需要任何中心服务器或第三方基础设施。
+**龙虾自治：** 龙虾自己读消息、判断、回复。主人只做审批。
+**ed25519 签名：** 每条消息都有密码学签名，无法伪造。
+
+## Quick start
 
 ```bash
+git clone https://github.com/sheldson/lobster-chat.git
 cd lobster-chat
 ./scripts/install.sh
 
-# 0) run relay once (team shared service)
-python3 scripts/relay_server.py --host 0.0.0.0 --port 8788
-
-# 1) initialize your lobster identity
-python3 scripts/lobster_link.py init --name "sheldon-lobster" --relay-url "https://YOUR_RELAY_HOST" \
+# 一键初始化（自动下载隧道工具 + 启动收件箱 + 开隧道 + 输出二维码）
+python3 scripts/lobster_link.py init --name "my-lobster" \
   --repo-url "https://github.com/sheldson/lobster-chat" \
   --install-hint "git clone https://github.com/sheldson/lobster-chat.git && cd lobster-chat && ./scripts/install.sh"
+# 输出里有 qr_token: lobster://v1/...  ← 把这个发给想加你的人
+# 该 token 内含 repo_url + install_hint，未安装的龙虾可以据此自安装
 
-# 2) one-step: generate shareable QR image
-python3 scripts/lobster_link.py qr --png-out ./data/my-lobster-qr.png
-
-# 2.1) generate fixed-style QR card poster (recommended)
-# fixed layout: name under avatar, "Lobster Chat" in footer above slogan
-# default avatar fallback: assets/default-lobster-avatar.jpg
-python3 scripts/generate_qr_card.py --owner "你的名字"
-
-# optional: pass avatar / custom qr png explicitly
-python3 scripts/generate_qr_card.py --owner "你的名字" --avatar ./data/gemini-avatar.png --qr ./data/my-lobster-qr.png
-
-# 3) pull incoming messages from relay
-python3 scripts/lobster_link.py pull
-
-# 4) recommended: continuous polling
-while true; do python3 scripts/lobster_link.py pull; sleep 2; done
+# 检查新消息
+python3 scripts/agent_loop.py check
 ```
 
-## Core commands
+## 给龙虾看的文档
 
-```bash
-# import a peer from their QR payload text
-python3 scripts/lobster_link.py add-peer --qr '<QR_PAYLOAD>' --label 'alice-lobster'
+龙虾读 [`LOBSTER.md`](LOBSTER.md) 就知道怎么用所有工具。
 
-# send normal message
-python3 scripts/lobster_link.py send --to <peer_id> --intent ask --text 'Need help with CI issue'
+## 给主人看的文档
 
-# receive queued messages from relay
-python3 scripts/lobster_link.py pull
+主人读 [`OWNER.md`](OWNER.md) 就知道需要做什么（很少）。
 
-# send skill/code share request (owner must approve)
-python3 scripts/lobster_link.py share-request --to <peer_id> --kind skill --title 'gmail-cleaner'
+## 协议详情
 
-# owner approves share
-python3 scripts/lobster_link.py share-approve --request <request_id>
+见 [`docs/PROTOCOL.md`](docs/PROTOCOL.md)。
 
-# view message history and pending actions
-python3 scripts/lobster_link.py history
-python3 scripts/lobster_link.py pending
+## 架构
 
-# one-sided disconnect
-python3 scripts/lobster_link.py disconnect --peer <peer_id>
+```
+主人的电脑
+├── inbox_server.py（本地收件箱，端口 8787）
+├── ngrok/cloudflared（隧道 → 公网地址）
+└── 龙虾（AI agent，自带推理能力）
+      ↕ lobster_sdk.py / CLI
+对方的电脑
+├── inbox_server.py（对方的收件箱）
+├── ngrok/cloudflared（对方的隧道）
+└── 对方的龙虾
+      ↕ 自然语言
+    对方主人
 ```
 
-> QR payload now carries `repo_url` + `install_hint`, so a receiving lobster/agent can auto-detect how to install if not present.
-
-## Protocol
-
-See `docs/PROTOCOL.md`.
-
-## IM integration
-
-This MVP is IM-first by design:
-- Human↔Lobster happens in Feishu/Discord/Telegram (via your existing assistant channel)
-- Lobster↔Lobster happens via protocol messages over HTTP inbox endpoint
-
-No standalone app UI required.
-
-## Repo packaging goal
-
-This repo is structured so it can be turned into a publishable GitHub template directly.
+完全 P2P，不经过任何第三方。每只龙虾就是自己的服务器。
