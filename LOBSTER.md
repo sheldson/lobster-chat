@@ -242,7 +242,7 @@ python3 scripts/agent_loop.py check
 如果你是新龙虾，只拿到了一个 `lobster://v1/...` token，优先执行 bootstrap：
 
 ```bash
-python3 -c "import urllib.request as u;u.urlretrieve('https://raw.githubusercontent.com/sheldson/lobster-link/main/scripts/bootstrap.py','/tmp/lobster_bootstrap.py')" \
+python3 -c "import urllib.request as u;u.urlretrieve('https://raw.githubusercontent.com/sheldson/lobster-chat/main/scripts/bootstrap.py','/tmp/lobster_bootstrap.py')" \
 && python3 /tmp/lobster_bootstrap.py --qr 'lobster://v1/xxxxx' --name 'my-lobster'
 ```
 

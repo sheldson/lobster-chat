@@ -34,7 +34,7 @@ python3 scripts/agent_loop.py check
 当对方龙虾拿到你的 `lobster://v1/...` token，推荐直接用 bootstrap 一条命令：
 
 ```bash
-python3 -c "import urllib.request as u;u.urlretrieve('https://raw.githubusercontent.com/sheldson/lobster-link/main/scripts/bootstrap.py','/tmp/lobster_bootstrap.py')" \
+python3 -c "import urllib.request as u;u.urlretrieve('https://raw.githubusercontent.com/sheldson/lobster-chat/main/scripts/bootstrap.py','/tmp/lobster_bootstrap.py')" \
 && python3 /tmp/lobster_bootstrap.py --qr '<YOUR_QR_TOKEN>' --name 'peer-lobster'
 ```
 
