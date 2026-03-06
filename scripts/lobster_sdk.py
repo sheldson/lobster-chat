@@ -8,7 +8,10 @@ An AI agent imports this module and calls functions directly.
 import base64
 import datetime as dt
 import fcntl
+import ipaddress
 import json
+import os
+import stat
 import uuid
 from pathlib import Path
 from urllib import request
@@ -22,6 +25,7 @@ DATA = ROOT / "data"
 STATE = DATA / "state.json"
 INBOX = DATA / "inbox.jsonl"
 OUTBOX = DATA / "outbox.jsonl"
+INBOX_ARCHIVE = DATA / "inbox_archive.jsonl"
 PENDING = DATA / "pending_shares.json"
 
 
@@ -47,11 +51,26 @@ def _ensure_files():
 
 def _load_state():
     _ensure_files()
-    return json.loads(STATE.read_text())
+    with STATE.open("r", encoding="utf-8") as f:
+        fcntl.flock(f, fcntl.LOCK_SH)
+        try:
+            return json.loads(f.read())
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
 
 
 def _save_state(s):
-    STATE.write_text(json.dumps(s, ensure_ascii=False, indent=2))
+    with STATE.open("w", encoding="utf-8") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            f.write(json.dumps(s, ensure_ascii=False, indent=2))
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+    # Restrict permissions: state.json contains the signing private key
+    try:
+        os.chmod(STATE, stat.S_IRUSR | stat.S_IWUSR)  # 0600
+    except OSError:
+        pass  # Windows or other OS without Unix permissions
 
 
 def _append_jsonl(path, obj):
@@ -82,26 +101,33 @@ def _verify_ed25519(verify_key_b64: str, payload_obj: dict, sig_b64: str) -> boo
 
 
 def _validate_endpoint(url: str) -> bool:
-    """Validate that an endpoint URL is a safe external HTTPS URL."""
+    """Validate that an endpoint URL is a safe external HTTPS URL.
+
+    Uses ipaddress module to catch IPv4, IPv6, IPv4-mapped IPv6, and other
+    private/reserved address forms that string-based checks miss.
+    """
     try:
         parsed = urlparse(url)
         if parsed.scheme not in ("https", "http"):
             return False
         host = parsed.hostname or ""
-        # Block private/internal IPs and metadata endpoints
-        if host in ("localhost", "127.0.0.1", "0.0.0.0", "::1", ""):
-            return False
-        if host.startswith("169.254.") or host.startswith("10."):
-            return False
-        if host.startswith("172."):
-            parts = host.split(".")
-            if len(parts) >= 2 and parts[1].isdigit() and 16 <= int(parts[1]) <= 31:
-                return False
-        if host.startswith("192.168."):
+        if not host:
             return False
         # Must end with /lobster/inbox
         if not parsed.path.rstrip("/").endswith("/lobster/inbox"):
             return False
+        # Block well-known internal hostnames
+        if host in ("localhost", "metadata.google.internal"):
+            return False
+        # Resolve host as IP address — blocks all private/reserved ranges
+        # including IPv6-mapped IPv4 (::ffff:169.254.x.x), link-local, etc.
+        try:
+            addr = ipaddress.ip_address(host)
+            if addr.is_private or addr.is_reserved or addr.is_loopback or addr.is_link_local:
+                return False
+        except ValueError:
+            # Not an IP literal — it's a hostname, which is OK
+            pass
         return True
     except Exception:
         return False
@@ -325,6 +351,8 @@ def update_endpoint(endpoint: str) -> dict:
     me = s.get("me")
     if not me:
         return {"ok": False, "error": "not_initialized"}
+    if not _validate_endpoint(endpoint):
+        return {"ok": False, "error": "invalid_or_unsafe_endpoint"}
     me["endpoint"] = endpoint
     _save_state(s)
     return {"ok": True, "endpoint": endpoint}
@@ -518,24 +546,30 @@ def pull_messages() -> dict:
 
         peer = s["peers"].get(frm)
         vk = peer.get("verify_key", "") if peer else ""
-        # For friend_request, verify_key comes in the body
-        if m.get("intent") == "friend_request" and not vk:
-            vk = m.get("body", {}).get("verify_key", "")
+        # For friend_request, verify_key comes in the body (TOFU model).
+        # If we already know this peer with a different key, reject (spoofing).
+        if m.get("intent") == "friend_request":
+            body_vk = m.get("body", {}).get("verify_key", "")
+            if not body_vk:
+                events.append({"event": "friend_request_missing_key", "from": frm, "message_id": m.get("id")})
+                continue
+            if vk and vk != body_vk:
+                events.append({"event": "verify_key_mismatch", "from": frm, "message_id": m.get("id")})
+                continue
+            vk = body_vk
 
         if not vk:
             events.append({"event": "no_verify_key", "from": frm, "message_id": m.get("id")})
             continue
 
         if not _verify_ed25519(vk, m, sig):
-            m["sig"] = sig
-            m["_sig_valid"] = False
-            _append_jsonl(INBOX, m)
             events.append({"event": "sig_invalid", "from": frm, "message_id": m.get("id")})
             continue
 
+        # Restore sig and archive verified message (NOT back into inbox)
         m["sig"] = sig
         m["_sig_valid"] = True
-        _append_jsonl(INBOX, m)
+        _append_jsonl(INBOX_ARCHIVE, m)
         ev = _process_protocol_message(s, m)
         if ev:
             events.append(ev)
@@ -564,7 +598,7 @@ def get_conversation_history(peer_id: str = "", limit: int = 50) -> dict:
     Returns both inbox and outbox messages, sorted by timestamp."""
     _ensure_files()
     messages = []
-    for path, direction in [(INBOX, "received"), (OUTBOX, "sent")]:
+    for path, direction in [(INBOX_ARCHIVE, "received"), (OUTBOX, "sent")]:
         text = path.read_text().strip()
         if not text:
             continue

@@ -3,6 +3,8 @@ import argparse
 import base64
 import datetime as dt
 import json
+import os
+import stat
 import sys
 import uuid
 from pathlib import Path
@@ -42,6 +44,10 @@ def load_state():
 
 def save_state(s):
     STATE.write_text(json.dumps(s, ensure_ascii=False, indent=2))
+    try:
+        os.chmod(STATE, stat.S_IRUSR | stat.S_IWUSR)  # 0600
+    except OSError:
+        pass
 
 
 def append_jsonl(path, obj):
@@ -57,7 +63,16 @@ def sign_ed25519(signing_key_b64, payload_obj):
     return base64.urlsafe_b64encode(signed.signature).decode("utf-8")
 
 
+def validate_endpoint(url):
+    """Reuse SDK's endpoint validation to prevent SSRF."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from lobster_sdk import _validate_endpoint
+    return _validate_endpoint(url)
+
+
 def post_json(url, payload):
+    if not validate_endpoint(url):
+        raise ValueError(f"Invalid or unsafe endpoint URL: {url}")
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     req = request.Request(url, data=data, method="POST", headers={"Content-Type": "application/json"})
     with request.urlopen(req, timeout=12) as resp:
@@ -503,6 +518,8 @@ def cmd_update_endpoint(args):
     me = s.get("me")
     if not me:
         raise SystemExit("Not initialized.")
+    if not validate_endpoint(args.endpoint):
+        raise SystemExit(f"Invalid or unsafe endpoint URL: {args.endpoint}")
     me["endpoint"] = args.endpoint
     save_state(s)
     print(json.dumps({"ok": True, "endpoint": args.endpoint}, ensure_ascii=False))

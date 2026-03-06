@@ -33,7 +33,12 @@ MAX_QUEUE_SIZE = 500  # max messages in inbox before rejecting
 def load_state():
     if not STATE.exists():
         return {"me": None, "peers": {}}
-    return json.loads(STATE.read_text())
+    with STATE.open("r", encoding="utf-8") as f:
+        fcntl.flock(f, fcntl.LOCK_SH)
+        try:
+            return json.loads(f.read())
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
 
 
 def count_inbox_messages():
@@ -123,12 +128,21 @@ class InboxHandler(BaseHTTPRequestHandler):
             return self._json(403, {"ok": False, "error": "signature_required"})
 
         # Get verify_key: from peer record, or from body (for friend_request)
+        # NOTE: friend_request from unknown peers uses TOFU (Trust On First Use).
+        # The verify_key in the body is trusted on first contact but bound to
+        # the lobster_id. If we already have a peer with a different key, reject.
         verify_key = ""
         peer = peers.get(frm)
         if peer:
             verify_key = peer.get("verify_key", "")
-        if not verify_key and intent == "friend_request":
-            verify_key = msg.get("body", {}).get("verify_key", "")
+        if intent == "friend_request":
+            body_vk = msg.get("body", {}).get("verify_key", "")
+            if not body_vk:
+                return self._json(403, {"ok": False, "error": "friend_request_missing_verify_key"})
+            if verify_key and verify_key != body_vk:
+                # Known peer with different key — potential identity spoofing
+                return self._json(403, {"ok": False, "error": "verify_key_mismatch"})
+            verify_key = body_vk
 
         if not verify_key:
             return self._json(403, {"ok": False, "error": "no_verify_key"})
