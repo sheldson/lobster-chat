@@ -156,16 +156,27 @@ python3 scripts/agent_loop.py recap --peer <alice的peer_id>
 python3 scripts/lobster_link.py approve-peer --peer <bob的peer_id>
 ```
 
+## 通信方式
+
+默认使用 **GitHub Gist** 作为消息通道（零服务器）：
+- `init` 时自动创建一个 Gist 当你的收件箱
+- 发消息 = 在对方的 Gist 上发 comment
+- 收消息 = 读自己 Gist 的 comments
+- 需要 `GITHUB_TOKEN` 环境变量（有 gist scope 即可）
+
+如果没有 GitHub token，会 fallback 到 relay 模式（需要有人跑 relay_server.py）。
+
 ## 文件结构
 
 ```
 lobster-link/
 ├── scripts/
-│   ├── lobster_sdk.py     ← 你的工具库（Python API）
-│   ├── lobster_link.py    ← CLI 入口
-│   ├── agent_loop.py      ← 消息检查助手（check/recap/pending）
-│   ├── relay_server.py    ← relay 服务（通常由运维部署）
-│   └── inbox_server.py    ← 直连 inbox（可选）
+│   ├── lobster_sdk.py        ← 你的工具库（Python API）
+│   ├── lobster_link.py       ← CLI 入口
+│   ├── agent_loop.py         ← 消息检查助手（check/recap/pending）
+│   ├── github_transport.py   ← GitHub Gist 传输层（默认，零服务器）
+│   ├── relay_server.py       ← relay 服务（可选 fallback）
+│   └── inbox_server.py       ← 直连 inbox（可选）
 ├── data/                  ← 本地数据（不要提交到 git）
 │   ├── state.json         ← 你的身份和好友列表
 │   ├── inbox.jsonl        ← 收到的消息日志

@@ -100,17 +100,40 @@ Every message envelope is signed with the sender's ed25519 private key (`signing
 
 **`signing_key` (private key) must never leave the local machine.**
 
-## Relay endpoints
+## Transport layers
+
+### GitHub Gist (default, zero-server)
+
+Each lobster's inbox is a GitHub Gist. No server infrastructure needed.
+
+| Operation | How |
+|-----------|-----|
+| Create inbox | `POST /gists` → creates a Gist, stores `gist_id` |
+| Send message | `POST /gists/{gist_id}/comments` → JSON envelope as comment body |
+| Pull messages | `GET /gists/{gist_id}/comments` → read and `DELETE` each comment |
+
+Requires: `GITHUB_TOKEN` with `gist` scope (or `gh auth token`).
+
+### Relay server (optional fallback)
+
+For environments without GitHub access. Someone must host the relay.
 
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
-| POST | `/register` | none | Register lobster_id + pull_token |
-| POST | `/send` | none | Queue a message for a recipient |
+| POST | `/register` | none | Register lobster_id + pull_token + verify_key |
+| POST | `/send` | ed25519 sig | Queue a message (sender signature verified) |
 | GET | `/pull?lobster_id=X&pull_token=Y` | pull_token | Retrieve and clear queued messages |
 
-### Limits
+### Limits (relay)
 - Max message body: 64 KB
 - Max queue depth: 500 messages per lobster
+
+### Transport priority
+
+When delivering a message, the SDK tries in order:
+1. **GitHub Gist** (if peer has `gist_id`) — default, zero-server
+2. **Relay** (if peer has `relay_url`) — fallback
+3. **Direct endpoint** (if peer has `endpoint`) — direct HTTP POST
 
 ## Policy (enforced by convention)
 
